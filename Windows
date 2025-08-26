@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+import sys, os, asyncio, platform, collections, time, ctypes
+from bleak import BleakScanner, BleakClient
+from bleak.exc import BleakError
+
+print(f"🛠️ Running with Python: {sys.executable}")
+print(f"📂 Working dir: {os.getcwd()}")
+
+IS_WINDOWS = platform.system() == "Windows"
+if IS_WINDOWS:
+    from winrt.windows.devices.bluetooth.advertisement import (
+        BluetoothLEAdvertisementWatcher,
+        BluetoothLEScanningMode,
+    )
+
+# ---------- Windows helpers ----------
+def mac_to_ulong(mac: str) -> int:
+    # "D8:D0:87:33:25:9C" -> Windows ulong address (little-endian)
+    parts = mac.split(":")
+    value = 0
+    for i, p in enumerate(reversed(parts)):
+        value |= int(p, 16) << (i * 8)
+    return value
+
+def lock_pc():
+    """Lock current Windows session."""
+    try:
+        ctypes.windll.user32.LockWorkStation()
+        print("🔒 Windows locked.")
+    except Exception as e:
+        print(f"⚠️ Could not lock Windows: {e}")
+
+# ---------- App ----------
+class BLEExplorerCLI:
+    def __init__(self, name_filter=None, rssi_min=-100):
+        self.name_filter = name_filter
+        self.rssi_min = rssi_min
+        self.last_scan = {}           # address -> rssi (from discovery)
+        self._near = False            # optional proximity state
+
+    # Normalized discovery that works on Bleak 1.0.1 Windows and others
+    async def discover_devices(self, timeout: float = 5.0):
+        print("🔍 Scanning for BLE devices...")
+        ads = await BleakScanner.discover(timeout=timeout, return_adv=True)
+
+        entries = []
+        for key, val in ads.items():
+            device = None
+            adv = None
+
+            if isinstance(key, str):
+                # Windows: key = "AA:BB:...", value = (BLEDevice, AdvertisementData)
+                addr = key
+                if isinstance(val, tuple) and len(val) == 2:
+                    device, adv = val
+                else:
+                    adv = val
+            else:
+                # Other: key = BLEDevice, value = AdvertisementData
+                device = key
+                addr = getattr(device, "address", None) or str(key)
+                adv = val
+
+            name = (getattr(adv, "local_name", None)
+                    or (getattr(device, "name", None) if device else None)
+                    or "Unknown")
+
+            # RSSI from adv, else from WinRT event args, else from device
+            rssi = getattr(adv, "rssi", None) if adv is not None else None
+            if rssi is None and adv is not None:
+                try:
+                    plat = getattr(adv, "platform_data", None)
+                    if plat:
+                        evt = plat[0]
+                        rssi = getattr(evt, "raw_signal_strength_in_dbm", None)
+                except Exception:
+                    pass
+            if rssi is None and device is not None:
+                rssi = getattr(device, "rssi", None)
+                if rssi is None:
+                    meta = getattr(device, "metadata", None)
+                    if isinstance(meta, dict):
+                        rssi = meta.get("rssi")
+
+            if rssi is not None:
+                self.last_scan[addr] = rssi
+            entries.append((addr, name, rssi))
+
+        filtered = [
+            (addr, name, rssi)
+            for addr, name, rssi in entries
+            if (rssi is not None
+                and (self.name_filter is None or self.name_filter in name)
+                and rssi >= self.rssi_min)
+        ]
+        if not filtered:
+            print("❌ No matching BLE devices found.")
+        else:
+            print(f"   {len(filtered)} device(s) passed filter.")
+        return filtered
+
+    # Continuous RSSI monitor (Windows watcher) + retarget + lock rule
+    async def monitor_rssi_continuous(
+        self,
+        address: str,
+        name: str,
+        client: BleakClient,                # pass the connected client
+        avg_window: int = 8,
+        sample_period_s: float = 0.3,
+        near_threshold: int = -65,
+        far_threshold: int = -75,
+        run_seconds: float = 0.0,           # 0 = run until condition/idle/ctrl+c
+        idle_timeout_s: float = 30.0,       # ↑ default 30s as requested
+        lock_threshold: int = -50,          # lock if LIVE < this
+        lock_required_scans: int = 5,       # ...for this many consecutive scans
+        lock_on_idle_stop: bool = True,     # lock if we stop due to idle
+    ) -> bool:
+        """
+        Returns True if it locked the PC, False otherwise.
+        Lock rule: 5 scans in a row with LIVE RSSI < lock_threshold.
+        Also retargets when the device rotates address but keeps the same name.
+        """
+        if not IS_WINDOWS:
+            print("⚠️ Continuous watcher requires Windows; skipping.")
+            return False
+
+        watcher = BluetoothLEAdvertisementWatcher()
+        watcher.scanning_mode = BluetoothLEScanningMode.ACTIVE
+        target_addr = mac_to_ulong(address)
+        target_name = (name or "").strip().lower()
+
+        rssi_deque = collections.deque(maxlen=avg_window)
+        current_rssi = None
+        last_seen = time.time()
+        last_print = 0.0
+        consecutive_under = 0
+        locked_triggered = False
+
+        def process_sample(addr_int, rssi_val):
+            nonlocal current_rssi, last_seen, target_addr
+            current_rssi = rssi_val
+            rssi_deque.append(rssi_val)
+            last_seen = time.time()
+            # If this packet is from a new address but same name, retarget
+            if addr_int != target_addr:
+                print(f"♻️ Retargeting to new RPA address: {format(addr_int, '#014x')} (same name)")
+                target_addr = addr_int
+
+        def on_received(sender, args):
+            try:
+                addr_int = args.bluetooth_address
+                local_name = ""
+                try:
+                    local_name = (args.advertisement.local_name or "").strip()
+                except Exception:
+                    pass
+                rssi_val = args.raw_signal_strength_in_dbm
+
+                # If it's our current address -> accept
+                if addr_int == target_addr:
+                    process_sample(addr_int, rssi_val)
+                    return
+
+                # Otherwise, if the name matches, treat as same device and retarget
+                if target_name and local_name and local_name.strip().lower() == target_name:
+                    process_sample(addr_int, rssi_val)
+            except Exception:
+                # Swallow any rare WinRT access errors
+                pass
+
+        token = watcher.add_received(on_received)
+        watcher.start()
+        print(f"📡 RSSI monitor started (lock if live<{lock_threshold} dBm for {lock_required_scans} scans). Press Ctrl+C to stop.")
+
+        t0 = time.time()
+        try:
+            while True:
+                if run_seconds and (time.time() - t0) >= run_seconds:
+                    break
+
+                # If advertisements go quiet for too long, try connected-RSSI once; else optionally lock/stop
+                if idle_timeout_s and (time.time() - last_seen > idle_timeout_s):
+                    try:
+                        live = await client.get_rssi()
+                    except Exception:
+                        live = None
+
+                    if isinstance(live, int):
+                        # Treat connected RSSI as a fresh sample
+                        process_sample(target_addr, live)
+                    else:
+                        msg = f"⏳ No advertisements for {idle_timeout_s}s — stopping monitor."
+                        if lock_on_idle_stop:
+                            print(msg)
+                            print("🔐 Locking due to idle stop.")
+                            lock_pc()
+                            locked_triggered = True
+                        else:
+                            print(msg)
+                        break
+
+                # Compute average (for display only)
+                avg_rssi = (sum(rssi_deque) / len(rssi_deque)) if rssi_deque else None
+
+                # Throttled status prints (~2 Hz)
+                now = time.time()
+                if now - last_print >= 0.5:
+                    print(
+                        f"   RSSI live: {current_rssi if current_rssi is not None else '…'}  "
+                        f"avg({len(rssi_deque)}): {round(avg_rssi,1) if avg_rssi is not None else '…'} dBm  "
+                        f"[under<{lock_threshold}: {consecutive_under}/{lock_required_scans}]"
+                    )
+                    last_print = now
+
+                # UPDATE CONSECUTIVE COUNTER — using LIVE RSSI (lock when far)
+                if isinstance(current_rssi, int) and current_rssi < lock_threshold:
+                    consecutive_under += 1
+                else:
+                    consecutive_under = 0
+
+                # Trigger lock once rule is met (show avg in the message as requested)
+                if consecutive_under >= lock_required_scans:
+                    display_avg = round(avg_rssi, 1) if isinstance(avg_rssi, (int, float)) else current_rssi
+                    print(f"✅ Condition met: avg < {lock_threshold} dBm for {lock_required_scans} scans — locking PC.")
+                    lock_pc()
+                    locked_triggered = True
+                    break
+
+                await asyncio.sleep(sample_period_s)
+        finally:
+            watcher.stop()
+            try:
+                watcher.remove_received(token)
+            except Exception:
+                pass
+            print("🛑 RSSI monitor stopped.")
+        return locked_triggered
+
+    async def on_near(self, rssi_value):
+        print(f"🚀 [NEAR] Avg RSSI {round(rssi_value,1)} dBm — perform NEAR action (optional).")
+
+    async def on_far(self, rssi_value):
+        print(f"🔒 [FAR] Avg RSSI {round(rssi_value,1)} dBm — perform FAR action (optional).")
+
+    async def connect_and_monitor_once(self, address: str, name: str) -> bool:
+        """
+        Connects, lists GATT, runs the RSSI monitor until it either locks or stops,
+        then disconnects. Returns True if the lock rule was triggered.
+        """
+        print(f"\n🔗 Connecting to {address} ({name})...")
+        client = BleakClient(address, timeout=20.0)
+        locked_triggered = False
+        try:
+            # Pairing first (may be no-op if already paired)
+            try:
+                paired = await client.pair(protection_level=1)
+                if paired:
+                    print("🔒 Paired (pre-connect).")
+            except Exception as e:
+                print(f"ℹ️ Pair pre-connect skipped: {e}")
+
+            await client.connect()
+            if not client.is_connected:
+                print("❌ Connection failed.")
+                return False
+
+            # Try connected RSSI; fallback to last_scan
+            try:
+                live_rssi = await client.get_rssi()
+                src = "connected"
+            except Exception:
+                live_rssi, src = None, "unknown"
+            if live_rssi is None:
+                live_rssi = self.last_scan.get(address)
+                src = "scan" if live_rssi is not None else src
+            print(f"✅ Connected — RSSI: {live_rssi if live_rssi is not None else 'N/A'} dBm ({src})")
+
+            # List GATT (optional)
+            print("\n📚 GATT services & characteristics:")
+            for svc in client.services:
+                print(f"   • Service {svc.uuid}")
+                for c in svc.characteristics:
+                    print(f"     ↳ {c.uuid} (props: {','.join(c.properties)})")
+
+            # Start continuous RSSI monitor with retarget + lock rule (live < -50 for 5 scans)
+            if IS_WINDOWS:
+                print("\n▶️ Starting continuous RSSI monitoring (retarget + lock rule active).")
+                locked_triggered = await self.monitor_rssi_continuous(
+                    address,
+                    name,
+                    client,                 # pass client for fallback polling
+                    avg_window=1000,
+                    sample_period_s=0.3,
+                    near_threshold=-65,
+                    far_threshold=-75,
+                    run_seconds=0.0,        # run until locked or idle stop
+                    idle_timeout_s=30.0,    # ↑ 30s as requested
+                    lock_threshold=-50,      # requirement
+                    lock_required_scans=10,   # requirement
+                    lock_on_idle_stop=True,  # still lock when idle-stopping
+                )
+            else:
+                print("⚠️ Continuous monitor is Windows-only in this version.")
+        except BleakError as e:
+            print(f"❗ BLE error: {e}")
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            print("🔌 Disconnected.")
+        return locked_triggered
+
+    async def watch_device_forever(
+        self,
+        address: str,
+        name: str,
+        reconnect_delay_s: float = 5.0,
+        cooldown_after_lock_s: float = 8.0,
+    ):
+        """
+        Infinite loop: connect -> monitor -> (lock or stop) -> disconnect -> wait -> repeat.
+        After you unlock your PC, the script will keep running and reconnect automatically.
+        Press Ctrl+C to exit.
+        """
+        print(f"♾️  Watching {name} @ {address} in a loop. Ctrl+C to stop.")
+        while True:
+            try:
+                locked = await self.connect_and_monitor_once(address, name)
+                if locked:
+                    # Give the OS a moment after lock (and for you to unlock)
+                    await asyncio.sleep(cooldown_after_lock_s)
+                else:
+                    # If monitor stopped for other reasons (idle/no adv), brief backoff
+                    await asyncio.sleep(reconnect_delay_s)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"⚠️ Loop error: {e}")
+                await asyncio.sleep(reconnect_delay_s)
+
+# ---------- Entry ----------
+async def main():
+    cli = BLEExplorerCLI(name_filter=None, rssi_min=-100)
+    devices = await cli.discover_devices()
+    if not devices:
+        print("❌ No devices passed the filter.")
+        return
+
+    devices.sort(key=lambda x: x[2], reverse=True)
+    print("\n📋 Filtered devices (strongest first):")
+    for i, (addr, name, rssi) in enumerate(devices):
+        print(f" {i}: {name} @ {addr} (RSSI {rssi})")
+
+    try:
+        idx = int(input("\nSelect device # to connect & loop: "))
+        address, name = devices[idx][0], devices[idx][1]
+    except Exception:
+        print("❌ Invalid selection.")
+        return
+
+    try:
+        await cli.watch_device_forever(address, name)
+    except KeyboardInterrupt:
+        print("\n👋 Exiting on user request.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Exiting.")
