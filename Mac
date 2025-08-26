@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+import asyncio
+import platform
+import subprocess
+import time
+
+from bleak import BleakScanner, BleakClient
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
+
+# --- Platform-Specific Screen Locking ---
+
+def lock_screen(monitoring_state, extra_info=""):
+    """Locks the computer screen using OS-specific commands."""
+    system = platform.system()
+    rssi_display = monitoring_state.get("last_rssi", "N/A")
+    print(f"\n--- 🔒 Locking computer... (Last RSSI: {rssi_display}) {extra_info} ---")
+    try:
+        if system == "Windows":
+            subprocess.run("rundll32.exe user32.dll,LockWorkStation", check=True)
+        elif system == "Darwin":  # macOS
+            subprocess.run([
+                "osascript", "-e",
+                'tell application "System Events" to keystroke "q" using {control down, command down}'
+            ], check=True)
+        elif system == "Linux":
+            subprocess.run("xdg-screensaver lock", shell=True, check=True)
+        else:
+            print(f"Unsupported operating system: {system}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"Error: Failed to lock screen. Command failed: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred while trying to lock the screen: {e}")
+
+    # --- Apply a safe cooldown after lock (so it won’t relock right after login) ---
+    monitoring_state["cooldown_until"] = time.time() + monitoring_state["cooldown_after_lock"]
+    monitoring_state["last_rssi"] = "N/A"
+    monitoring_state["below_threshold_since"] = None # Reset the timer after locking
+
+# --- Main Application ---
+
+async def main():
+    """Main function to discover, select, and monitor a BLE device."""
+    print("--- BLE Proximity Lock ---")
+    print("Scanning for Bluetooth devices for 10 seconds...")
+
+    # 1. Discover devices
+    try:
+        devices = await BleakScanner.discover(timeout=10.0, return_adv=True)
+    except Exception as e:
+        print(f"Error: Could not scan for devices. Ensure Bluetooth is enabled. Details: {e}")
+        return
+
+    if not devices:
+        print("No Bluetooth devices found. Please try again.")
+        return
+
+    # Filter out devices without a valid RSSI and then sort them
+    devices_with_rssi = [dev for dev in devices.values() if isinstance(dev[1].rssi, int)]
+    sorted_devices = sorted(devices_with_rssi, key=lambda x: x[1].rssi, reverse=True)
+
+    if not sorted_devices:
+        print("No devices with a valid RSSI signal were found.")
+        return
+    
+    print("\n--- Discovered Devices (Strongest Signal First) ---")
+    for i, (device, adv) in enumerate(sorted_devices):
+        device_name = device.name or adv.local_name or "Unknown"
+        rssi_display = adv.rssi
+        print(f" {i}: {device_name} (MAC Address: {device.address}, RSSI: {rssi_display})")
+
+    # 2. User selects a device
+    while True:
+        try:
+            choice = input(f"\nSelect your device by number (0-{len(sorted_devices) - 1}): ")
+            target_device_index = int(choice)
+            if 0 <= target_device_index < len(sorted_devices):
+                break
+            else:
+                print("Invalid number. Please try again.")
+        except (ValueError, IndexError):
+            print("Invalid input. Please enter a number from the list.")
+        except KeyboardInterrupt:
+            print("\nSelection cancelled. Exiting.")
+            return
+            
+    target_device, adv = sorted_devices[target_device_index]
+    target_address = target_device.address
+    target_name = target_device.name or "the selected device"
+    initial_rssi = adv.rssi if isinstance(adv.rssi, int) else "N/A"
+    print(f"✅ Monitoring: {target_name} ({target_address}), Initial RSSI: {initial_rssi}")
+
+    # 3. User defines the RSSI threshold
+    rssi_threshold = -75  # Default
+    while True:
+        try:
+            rssi_input = input(f"Enter RSSI threshold to lock below (e.g., -80, default is {rssi_threshold}): ")
+            if not rssi_input:
+                break
+            rssi_threshold = int(rssi_input)
+            if rssi_threshold > 0:
+                print("RSSI values are negative. Please enter a negative number.")
+                continue
+            break
+        except ValueError:
+            print("Invalid input. Please enter a whole number.")
+        except KeyboardInterrupt:
+            print("\nConfiguration cancelled. Exiting.")
+            return
+            
+    print(f"✅ Lock threshold set to: {rssi_threshold} dBm")
+
+    # --- IMPORTANT: macOS Permissions Check ---
+    if platform.system() == "Darwin":
+        print("\n--- ⚠️ macOS User Action Required ---")
+        print("Please ensure your terminal app (e.g., Terminal, iTerm, VS Code)")
+        print("has been granted Bluetooth permission in:")
+        print("System Settings > Privacy & Security > Bluetooth")
+        print("You MUST RESTART the terminal app after granting permission.")
+        print("------------------------------------------")
+
+    # --- Monitoring Logic ---
+    monitoring_state = {
+        "last_seen": time.time(),
+        "cooldown_until": 0,
+        "last_rssi": "N/A",
+        "cooldown_after_lock": 30,  # safe 30s cooldown after lock to avoid instant relock
+        "below_threshold_since": None, # Timestamp for when RSSI first dropped below threshold
+    }
+    
+    DEVICE_TIMEOUT_SECONDS = 15
+    LOCK_DELAY_SECONDS = 5
+
+    def detection_callback(device: BLEDevice, advertisement_data: AdvertisementData):
+        """Called whenever a BLE advertisement is received."""
+        if device.address != target_address:
+            return
+        if time.time() < monitoring_state["cooldown_until"]:
+            return
+
+        rssi_value = advertisement_data.rssi
+        if isinstance(rssi_value, int):
+            monitoring_state["last_rssi"] = rssi_value
+            monitoring_state["last_seen"] = time.time()
+            
+            if rssi_value < rssi_threshold:
+                # If this is the first time we're below the threshold, record the time.
+                if monitoring_state["below_threshold_since"] is None:
+                    monitoring_state["below_threshold_since"] = time.time()
+                # If it has been below the threshold for long enough, lock.
+                elif time.time() - monitoring_state["below_threshold_since"] >= LOCK_DELAY_SECONDS:
+                    lock_screen(monitoring_state, f"(Signal below {rssi_threshold} dBm for {LOCK_DELAY_SECONDS}s)")
+            else:
+                # If the signal recovers, reset the timer.
+                monitoring_state["below_threshold_since"] = None
+        else:
+            monitoring_state["last_seen"] = time.time()
+
+    scanner = BleakScanner(detection_callback)
+    await scanner.start()
+    print(f"\n--- 📡 Monitoring started. Press Ctrl+C to stop. ---")
+
+    try:
+        while True:
+            await asyncio.sleep(1)
+            if time.time() < monitoring_state["cooldown_until"]:
+                cooldown_remaining = int(monitoring_state['cooldown_until'] - time.time())
+                print(f"\rCooldown active. Resuming in {cooldown_remaining}s...      ", end="")
+                continue
+
+            if time.time() - monitoring_state["last_seen"] > DEVICE_TIMEOUT_SECONDS:
+                last_rssi = monitoring_state["last_rssi"]
+                lock_screen(monitoring_state, f"(Timeout: no signal for {DEVICE_TIMEOUT_SECONDS}s, last RSSI {last_rssi})")
+                continue
+
+            # Build the status message
+            last_rssi = monitoring_state["last_rssi"]
+            status_message = f"Monitoring '{target_name}'. Last seen RSSI: {last_rssi} dBm. Lock threshold: {rssi_threshold} dBm"
+            
+            # Add the countdown to the status message if applicable
+            if monitoring_state["below_threshold_since"] is not None:
+                elapsed = time.time() - monitoring_state["below_threshold_since"]
+                remaining = max(0, LOCK_DELAY_SECONDS - elapsed)
+                status_message += f" | Locking in {remaining:.1f}s..."
+            
+            print(f"\r{status_message}     ", end="")
+
+    except KeyboardInterrupt:
+        print("\n\nStopping monitor...")
+    finally:
+        await scanner.stop()
+        print("--- Monitor stopped. ---")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Exiting program.")
